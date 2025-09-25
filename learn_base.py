@@ -21,7 +21,7 @@ from TGN.tgn import TGN
 from TGAT import TGAT
 from utils import NeighborFinder, EarlyStopMonitor, RandEdgeSampler
 
-degree_dict = {"wikipedia": 20, "reddit": 20, "uci": 30, "mooc": 60, "enron": 30, "canparl": 30, "uslegis": 30}
+degree_dict = {"wikipedia": 20, "reddit": 20, "uci": 30, "mooc": 60, "enron": 30, "canparl": 30, "uslegis": 30, "DGraphFin": 20}
 
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for temporal GNN on future link prediction')
@@ -31,13 +31,20 @@ parser.add_argument('-d', '--data', type=str, help='data sources to use, try wik
 parser.add_argument('--bs', type=int, default=512, help='batch_size')
 parser.add_argument('--prefix', type=str, default='', help='prefix to name the checkpoints')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
-parser.add_argument('--n_head', type=int, default=2, help='number of heads used in attention layer')
+parser.add_argument('--n_head', type=int, default=4, help='number of heads used in attention layer')
 parser.add_argument('--n_epoch', type=int, default=100, help='number of epochs')
-parser.add_argument('--n_layer', type=int, default=3, help='number of network layers')
-parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
+parser.add_argument('--n_layer', type=int, default=2, help='number of network layers')
+parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
 parser.add_argument('--drop_out', type=float, default=0.5, help='dropout probability')
 parser.add_argument('--node_dim', type=int, default=100, help='Dimentions of the node embedding')
 parser.add_argument('--time_dim', type=int, default=100, help='Dimentions of the time embedding')
+
+def safe_contrast(model, args, src, dst, fake, ts, eid, sub_src, sub_dst, sub_bgd):
+    if args.base_type == "tgat":
+        return model.contrast(src, dst, fake, ts, eid, sub_src, sub_dst, sub_bgd, if_explain=False)
+    else:
+        return model.contrast(src, dst, fake, ts, eid, sub_src, sub_dst, sub_bgd,
+                              explain_weights=None, edge_attr=None)
 
 
 def eval_one_epoch(args, base_model, sampler, src, dst, ts, label, val_e_idx_l=None):
@@ -60,8 +67,9 @@ def eval_one_epoch(args, base_model, sampler, src, dst, ts, label, val_e_idx_l=N
             subgraph_src = base_model.grab_subgraph(src_l_cut, ts_l_cut)
             subgraph_tgt = base_model.grab_subgraph(dst_l_cut, ts_l_cut)
             subgraph_bgd = base_model.grab_subgraph(dst_l_fake, ts_l_cut)
-            pos_prob, neg_prob = base_model.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, e_l_cut,
-                                               subgraph_src, subgraph_tgt, subgraph_bgd, explain_weights=None, edge_attr=None)
+            pos_prob, neg_prob = safe_contrast(base_model, args, src_l_cut, dst_l_cut, dst_l_fake,
+                                   ts_l_cut, e_l_cut, subgraph_src, subgraph_tgt, subgraph_bgd)
+
             pos_prob = pos_prob.sigmoid().squeeze(-1)
             neg_prob = neg_prob.sigmoid().squeeze(-1)
             pred_score = np.concatenate([(pos_prob).cpu().numpy(), neg_prob.cpu().numpy()])
@@ -154,8 +162,18 @@ for i in range(1):
                                 num_tokens=args.n_degree, num_layers=args.n_layer,
                                 dropout=args.drop_out)
     elif args.base_type == "tgat":
-        base_model = TGAT(n_feat, e_feat, num_layers=args.n_layer, num_neighbors=args.n_degree,
-            n_head=args.n_head, drop_out=args.drop_out)
+        print(f"🧪 n_head = {args.n_head}, time_dim = {args.time_dim}")
+
+        # 🌟 TGAT要自己创建随机embedding，不用传n_feat
+        num_nodes = max_idx + 1  # 你上面已经算过max_idx了
+        n_feat_tgat = np.random.normal(0, 1, size=(num_nodes, args.node_dim)).astype(np.float32)
+        e_feat_tgat = np.zeros((len(g_df), args.node_dim)).astype(np.float32)  # 边特征用全0，标准做法
+
+        base_model = TGAT(n_feat_tgat, e_feat_tgat,
+                          num_layers=args.n_layer,
+                          num_neighbors=args.n_degree,
+                          n_head=args.n_head,
+                          drop_out=args.drop_out)
     else:
         raise ValueError(f"Wrong value for base_type {args.base_type}!")
 
@@ -199,12 +217,8 @@ for i in range(1):
             subgraph_src = base_model.grab_subgraph(src_l_cut, ts_l_cut)
             subgraph_tgt = base_model.grab_subgraph(dst_l_cut, ts_l_cut)
             subgraph_bgd = base_model.grab_subgraph(dst_l_fake, ts_l_cut)
-            if args.base_type == "tgat":
-                pos_prob, neg_prob = base_model.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, e_l_cut,
-                                    subgraph_src, subgraph_tgt, subgraph_bgd, if_explain=False)
-            else:
-                pos_prob, neg_prob = base_model.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, e_l_cut,
-                                                subgraph_src, subgraph_tgt, subgraph_bgd, explain_weights=None, edge_attr=None)
+            pos_prob, neg_prob = safe_contrast(base_model, args, src_l_cut, dst_l_cut, dst_l_fake,
+                                   ts_l_cut, e_l_cut, subgraph_src, subgraph_tgt, subgraph_bgd)
             pos_label = torch.ones((size, 1), dtype=torch.float, device=args.device, requires_grad=False)
             neg_label = torch.zeros((size, 1), dtype=torch.float, device=args.device, requires_grad=False)
             loss = criterion(pos_prob, pos_label) + criterion(neg_prob, neg_label)

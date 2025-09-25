@@ -241,7 +241,7 @@ def threshold_test(args, explanation, base_model, src_l_cut, dst_l_cut, dst_l_fa
 
 
 
-def eval_one_epoch_tgat(args, base_model, explainer, full_ngh_finder, sampler, src, dst, ts, val_e_idx_l, epoch, best_accuracy, test_pack, test_edge):
+def eval_one_epoch_tgat(args, base_model, explainer, full_ngh_finder, src, dst, ts, val_e_idx_l, epoch, best_accuracy, test_pack, test_edge):
     test_aps = []
     test_auc = []
     test_acc = []
@@ -278,11 +278,12 @@ def eval_one_epoch_tgat(args, base_model, explainer, full_ngh_finder, sampler, s
             y_ori = torch.where(y_pred > 0.5, 1., 0.).view(y_pred.size(0), 1)  # [2 * B, 1]
 
         explainer.eval()
-        graphlet_imp_src = explainer(walks_src, ts_l_cut, src_edge)
+        graphlet_imp_src = explainer(walks_src, src_l_cut, ts_l_cut, dst_l_cut)
+
         edge_imp_src = explainer.retrieve_edge_imp(subgraph_src, graphlet_imp_src, walks_src, training=args.if_bern)
-        graphlet_imp_tgt = explainer(walks_tgt, ts_l_cut, tgt_edge)
+        graphlet_imp_tgt = explainer(walks_tgt, dst_l_cut, ts_l_cut, dst_l_cut)
         edge_imp_tgt = explainer.retrieve_edge_imp(subgraph_tgt, graphlet_imp_tgt, walks_tgt, training=args.if_bern)
-        graphlet_imp_bgd = explainer(walks_bgd, ts_l_cut, bgd_edge)
+        graphlet_imp_bgd = explainer(walks_bgd, dst_l_fake, ts_l_cut, dst_l_cut)
         edge_imp_bgd = explainer.retrieve_edge_imp(subgraph_bgd, graphlet_imp_bgd, walks_bgd, training=args.if_bern)
         explain_weight = [[edge_imp_src, edge_imp_tgt], [edge_imp_src, edge_imp_bgd]]
         pos_logit, neg_logit = base_model.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, e_l_cut,
@@ -412,9 +413,10 @@ def eval_one_epoch(args, base_model, explainer, full_ngh_finder, src, dst, ts, v
             y_ori = torch.where(y_pred > 0.5, 1., 0.).view(y_pred.size(0), 1)  # [2 * B, 1]
 
         explainer.eval()
-        graphlet_imp_src = explainer(walks_src, ts_l_cut, src_edge)
-        graphlet_imp_tgt = explainer(walks_tgt, ts_l_cut, tgt_edge)
-        graphlet_imp_bgd = explainer(walks_bgd, ts_l_cut, bgd_edge)
+        graphlet_imp_src = explainer(walks_src, src_l_cut, ts_l_cut, dst_l_cut)
+        graphlet_imp_tgt = explainer(walks_tgt, dst_l_cut, ts_l_cut, dst_l_cut)
+        graphlet_imp_bgd = explainer(walks_bgd, dst_l_fake, ts_l_cut, dst_l_cut)
+
         explanation = explainer.retrieve_explanation(subgraph_src, graphlet_imp_src, walks_src,
                                                      subgraph_tgt, graphlet_imp_tgt, walks_tgt,
                                                      subgraph_bgd, graphlet_imp_bgd, walks_bgd,
@@ -558,9 +560,10 @@ def train(args, base_model, train_pack, test_pack, train_edge, test_edge):
                 y_pred = torch.cat([pos_out_ori, neg_out_ori], dim=0).sigmoid()  # [B*2, 1]
                 y_ori = torch.where(y_pred > 0.5, 1., 0.).view(y_pred.size(0), 1)
             optimizer.zero_grad()
-            graphlet_imp_src = Explainer(walks_src, ts_l_cut, src_edge)
-            graphlet_imp_tgt = Explainer(walks_tgt, ts_l_cut, tgt_edge)
-            graphlet_imp_bgd = Explainer(walks_bgd, ts_l_cut, bgd_edge)
+            graphlet_imp_src = Explainer(walks_src, src_l_cut, ts_l_cut, dst_l_cut)
+            graphlet_imp_tgt = Explainer(walks_tgt, dst_l_cut, ts_l_cut, dst_l_cut)
+            graphlet_imp_bgd = Explainer(walks_bgd, dst_l_fake, ts_l_cut, dst_l_cut)
+
             if args.base_type == "tgat":
                 edge_imp_src = Explainer.retrieve_edge_imp(subgraph_src, graphlet_imp_src, walks_src, training=args.if_bern)
                 edge_imp_tgt = Explainer.retrieve_edge_imp(subgraph_tgt, graphlet_imp_tgt, walks_tgt, training=args.if_bern)
@@ -618,7 +621,7 @@ def train(args, base_model, train_pack, test_pack, train_edge, test_edge):
 
         ### evaluation:
         if (epoch + 1) % args.verbose == 0:
-            best_acc = eval_one_epoch(args, base_model, Explainer, full_ngh_finder, test_src_l,
+            best_acc = eval_one_epoch_tgat(args, base_model, Explainer, full_ngh_finder, test_src_l,
                                       test_dst_l, test_ts_l, test_e_idx_l, epoch, best_acc, test_pack, test_edge)
 
 if __name__ == '__main__':
@@ -642,4 +645,3 @@ if __name__ == '__main__':
     test_edge = np.load(osp.join(osp.dirname(osp.realpath(__file__)),  'processed', f'{args.data}_test_edge.npy'))
 
     train(args, base_model, train_pack=train_pack, test_pack=test_pack, train_edge=train_edge, test_edge=test_edge)
-

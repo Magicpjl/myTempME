@@ -10,65 +10,96 @@ import os.path as osp
 import pickle
 import torch
 import pandas as pd
-import numpy as np
 from utils import NeighborFinder
+from utils import RandEdgeSampler
+
+np.random.seed(2023)
+random.seed(2023)
+torch.manual_seed(2023)  # 顺手把PyTorch也种子设了
+torch.cuda.manual_seed(2023)  # 如果用cuda
+torch.backends.cudnn.deterministic = True  # 让cudnn也固定行为
+torch.backends.cudnn.benchmark = False  # 这个也关掉，保证严格复现
 
 degree_dict = {"wikipedia":20, "reddit":20 ,"uci":30 ,"mooc":60, "enron": 30, "canparl": 30, "uslegis": 30}
 
 data = "wikipedia"
 NUM_NEIGHBORS = degree_dict[data]
 device = torch.device('cuda:0')
-MODE = "train"
+MODE = "test"
 model_name = "tgat"
 
 
 def load_data(mode, data):
-    g_df = pd.read_csv(osp.join(osp.dirname(osp.realpath(__file__)), '..', 'processed/ml_{}.csv'.format(data)))
+    g_df = pd.read_csv(osp.join(osp.dirname(osp.realpath(__file__)), 'processed/ml_{}.csv'.format(data)))
     val_time, test_time = list(np.quantile(g_df.ts, [0.70, 0.85]))
-    src_l = g_df.u.values
-    dst_l = g_df.i.values
+
+    # 原始数据
+    src_l_raw = g_df.u.values
+    dst_l_raw = g_df.i.values
     e_idx_l = g_df.idx.values
     label_l = g_df.label.values
     ts_l = g_df.ts.values
-    max_src_index = src_l.max()
-    max_idx = max(src_l.max(), dst_l.max())
-    random.seed(2023)
-    total_node_set = set(np.unique(np.hstack([g_df.u.values, g_df.i.values])))
+
+    # 建立新的连续编号
+    all_nodes = np.unique(np.hstack([src_l_raw, dst_l_raw]))
+    id_mapping = {old_id: new_id for new_id, old_id in enumerate(all_nodes)}
+    
+    # 统一全部映射
+    src_l = np.array([id_mapping[x] for x in src_l_raw])
+    dst_l = np.array([id_mapping[x] for x in dst_l_raw])
+    num_nodes = len(all_nodes)
+    max_idx = num_nodes - 1
+
+    # mask nodes
+    total_node_set = set(np.unique(np.hstack([src_l, dst_l])))
     num_total_unique_nodes = len(total_node_set)
-    mask_node_set = set(random.sample(set(src_l[ts_l > val_time]).union(set(dst_l[ts_l > val_time])),
-                                      int(0.1 * num_total_unique_nodes)))
-    mask_src_flag = g_df.u.map(lambda x: x in mask_node_set).values
-    mask_dst_flag = g_df.i.map(lambda x: x in mask_node_set).values
+    mask_candidates = set(src_l[ts_l > val_time]).union(set(dst_l[ts_l > val_time]))
+    mask_node_set = set(random.sample(mask_candidates, int(0.1 * num_total_unique_nodes)))
+
+    mask_src_flag = np.array([s in mask_node_set for s in src_l])
+    mask_dst_flag = np.array([d in mask_node_set for d in dst_l])
+
     none_node_flag = (1 - mask_src_flag) * (1 - mask_dst_flag)
     valid_train_flag = (ts_l <= val_time) * (none_node_flag > 0)
+    valid_val_flag = (ts_l <= test_time) * (ts_l > val_time)
+    valid_test_flag = ts_l > test_time
+
+    # 切割train/val/test
     train_src_l = src_l[valid_train_flag]
     train_dst_l = dst_l[valid_train_flag]
     train_ts_l = ts_l[valid_train_flag]
     train_e_idx_l = e_idx_l[valid_train_flag]
     train_label_l = label_l[valid_train_flag]
-    valid_val_flag = (ts_l <= test_time) * (ts_l > val_time)
-    valid_test_flag = ts_l > test_time
+
     val_src_l = src_l[valid_val_flag]
     val_dst_l = dst_l[valid_val_flag]
+
     test_src_l = src_l[valid_test_flag]
     test_dst_l = dst_l[valid_test_flag]
     test_ts_l = ts_l[valid_test_flag]
     test_e_idx_l = e_idx_l[valid_test_flag]
     test_label_l = label_l[valid_test_flag]
+
+    # ====== 注意这里！重新建图，用新的编号！！ ======
     adj_list = [[] for _ in range(max_idx + 1)]
     for src, dst, eidx, ts in zip(train_src_l, train_dst_l, train_e_idx_l, train_ts_l):
         adj_list[src].append((dst, eidx, ts))
         adj_list[dst].append((src, eidx, ts))
+
     train_ngh_finder = NeighborFinder(adj_list)
-    # full graph with all the data for the test and validation purpose
+
     full_adj_list = [[] for _ in range(max_idx + 1)]
     for src, dst, eidx, ts in zip(src_l, dst_l, e_idx_l, ts_l):
         full_adj_list[src].append((dst, eidx, ts))
         full_adj_list[dst].append((src, eidx, ts))
+
     full_ngh_finder = NeighborFinder(full_adj_list)
+
+    # RandSampler
     train_rand_sampler = RandEdgeSampler((train_src_l,), (train_dst_l,))
-    # val_rand_sampler = RandEdgeSampler((train_src_l, val_src_l), (train_dst_l, val_dst_l))
     test_rand_sampler = RandEdgeSampler((train_src_l, val_src_l, test_src_l), (train_dst_l, val_dst_l, test_dst_l))
+
+    # 返回
     if mode == "test":
         return test_rand_sampler, test_src_l, test_dst_l, test_ts_l, test_label_l, test_e_idx_l, full_ngh_finder
     else:
@@ -95,14 +126,14 @@ def statistic(out_anony):
 
 
 
-def pre_processing(full_ngh_finder, sampler, src, dst, ts, val_e_idx_l, MODE="test", data="reddit"):
+def pre_processing(ngh_finder, sampler, src, dst, ts, val_e_idx_l, MODE="test", data="reddit"):
     load_dict = {}
     save_dict = {}
     for item in ["subgraph_src_0", "subgraph_src_1", "subgraph_tgt_0", "subgraph_tgt_1",  "subgraph_bgd_0", "subgraph_bgd_1", "walks_src", "walks_tgt", "walks_bgd", "dst_fake"]:
         load_dict[item] = []
     num_test_instance = len(src)
     print("start extracting subgraph")
-    for k in tqdm(range(num_test_instance-1)):
+    for k in tqdm(range(num_test_instance)):
         src_l_cut = src[k:k+1]
         dst_l_cut = dst[k:k+1]
         ts_l_cut = ts[k:k+1]
@@ -110,15 +141,15 @@ def pre_processing(full_ngh_finder, sampler, src, dst, ts, val_e_idx_l, MODE="te
         size = len(src_l_cut)
         src_l_fake, dst_l_fake = sampler.sample(size)
         load_dict["dst_fake"].append(dst_l_fake)
-        subgraph_src = ngh_finder.find_k_hop(src_l_cut, ts_l_cut, e_idx_l=e_l_cut)  #first: (batch, num_neighbors), second: [batch, num_neighbors * num_neighbors]
+        subgraph_src = ngh_finder.find_k_hop(2, src_l_cut, ts_l_cut, NUM_NEIGHBORS, e_idx_l=e_l_cut)  #first: (batch, num_neighbors), second: [batch, num_neighbors * num_neighbors]
         node_records, eidx_records, t_records = subgraph_src
         load_dict["subgraph_src_0"].append(np.concatenate([node_records[0], eidx_records[0], t_records[0]], axis=-1))  #append([1, num_neighbors * 3]
         load_dict["subgraph_src_1"].append(np.concatenate([node_records[1], eidx_records[1], t_records[1]], axis=-1))    #append([1, num_neighbors**2 * 3]
-        subgraph_tgt = ngh_finder.find_k_hop(dst_l_cut, ts_l_cut, e_idx_l=e_l_cut)
+        subgraph_tgt = ngh_finder.find_k_hop(2, dst_l_cut, ts_l_cut, NUM_NEIGHBORS, e_idx_l=e_l_cut)
         node_records, eidx_records, t_records = subgraph_tgt
         load_dict["subgraph_tgt_0"].append(np.concatenate([node_records[0], eidx_records[0], t_records[0]], axis=-1))  #append([1, num_neighbors * 3]
         load_dict["subgraph_tgt_1"].append(np.concatenate([node_records[1], eidx_records[1], t_records[1]], axis=-1))    #append([1, num_neighbors**2 * 3]
-        subgraph_bgd = ngh_finder.find_k_hop(dst_l_fake, ts_l_cut, e_idx_l=None)
+        subgraph_bgd = ngh_finder.find_k_hop(2, dst_l_fake, ts_l_cut, NUM_NEIGHBORS, e_idx_l=None)
         node_records, eidx_records, t_records = subgraph_bgd
         load_dict["subgraph_bgd_0"].append(np.concatenate([node_records[0], eidx_records[0], t_records[0]], axis=-1))  #append([1, num_neighbors * 3]
         load_dict["subgraph_bgd_1"].append(np.concatenate([node_records[1], eidx_records[1], t_records[1]], axis=-1))    #append([1, num_neighbors**2 * 3]
@@ -354,7 +385,48 @@ def calculate_edge(walks_src, walks_tgt, walks_bgd):
     edge_load = np.stack([edge_src, edge_tgt, edge_bgd],axis=0)
     return edge_load
 
-data_path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'processed',
+
+## Model initialize
+# for MODE in ["train", "test"]:
+#     for data in ["wikipedia"]:
+#         print(f"start {data} and {MODE}")
+#         gnn_model_path = osp.join(osp.dirname(osp.realpath(__file__)), 'params', 'tgnn', f'{model_name}_{data}.pt')
+#         tgat = torch.load(gnn_model_path)
+#         tgat = tgat.to(device)
+
+#         rand_sampler, test_src_l, test_dst_l, test_ts_l, test_label_l, test_e_idx_l, finder = load_data(mode=MODE, data=data)
+#         tgat.ngh_finder = finder
+#         pre_processing(finder, rand_sampler, test_src_l, test_dst_l, test_ts_l, test_e_idx_l, MODE=MODE, data=data)
+
+#         file = h5py.File(f'{data}_{MODE}.h5','r')
+#         subgraph_src_0 = file["subgraph_src_0"][:]
+#         subgraph_src_1 = file["subgraph_src_1"][:]
+#         subgraph_tgt_0 = file["subgraph_tgt_0"][:]
+#         subgraph_tgt_1 = file["subgraph_tgt_1"][:]
+#         subgraph_bgd_0 = file["subgraph_bgd_0"][:]
+#         subgraph_bgd_1 = file["subgraph_bgd_1"][:]
+#         walks_src = file["walks_src"][:]
+#         walks_tgt = file["walks_tgt"][:]
+#         walks_bgd = file["walks_bgd"][:]
+#         dst_fake = file["dst_fake"][:]
+#         file.close()
+
+#         walks_src_new, walks_tgt_new, walks_bgd_new = marginal(walks_src, walks_tgt, walks_bgd)
+#         file_new = h5py.File(f"{data}_{MODE}_cat.h5", "w")
+#         file_new.create_dataset("subgraph_src_0", data=subgraph_src_0)
+#         file_new.create_dataset("subgraph_src_1", data=subgraph_src_1)
+#         file_new.create_dataset("subgraph_tgt_0", data=subgraph_tgt_0)
+#         file_new.create_dataset("subgraph_tgt_1", data=subgraph_tgt_1)
+#         file_new.create_dataset("subgraph_bgd_0", data=subgraph_bgd_0)
+#         file_new.create_dataset("subgraph_bgd_1", data=subgraph_bgd_1)
+#         file_new.create_dataset("walks_src_new", data=walks_src_new)
+#         file_new.create_dataset("walks_tgt_new", data=walks_tgt_new)
+#         file_new.create_dataset("walks_bgd_new", data=walks_bgd_new)
+#         file_new.create_dataset("dst_fake", data=dst_fake)
+#         file_new.close()
+#         print(f"Done {data} {MODE}")
+
+data_path = osp.join(osp.dirname(osp.realpath(__file__)), 'processed',
                         f'{data}_{MODE}_cat.h5')
 file = h5py.File(data_path,'r')
 walks_src = file["walks_src_new"][:]
@@ -363,50 +435,8 @@ walks_bgd = file["walks_bgd_new"][:]
 file.close()
 print("start edge_features")
 edge_load = calculate_edge(walks_src, walks_tgt, walks_bgd)
-save_path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'processed',
+save_path = osp.join(osp.dirname(osp.realpath(__file__)), 'processed',
                         f"{data}_{MODE}_edge.npy")
 np.save(save_path, edge_load)
 print(f"Done {data} {MODE}")
-
-## Model initialize
-for MODE in [ "train"]:
-    for data in ["wikipedia"]:
-        print(f"start {data} and {MODE}")
-        gnn_model_path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'params', 'tgnn', f'{model_name}_{data}.pt')
-        tgat = torch.load(gnn_model_path)
-        tgat = tgat.to(device)
-
-        rand_sampler, test_src_l, test_dst_l, test_ts_l, test_label_l, test_e_idx_l, finder = load_data(mode=MODE, data=data)
-        tgat.ngh_finder = finder
-        pre_processing(tgat, rand_sampler, test_src_l, test_dst_l, test_ts_l, test_e_idx_l, MODE=MODE, data=data)
-
-        file = h5py.File(f'{data}_{MODE}.h5','r')
-        subgraph_src_0 = file["subgraph_src_0"][:]
-        subgraph_src_1 = file["subgraph_src_1"][:]
-        subgraph_tgt_0 = file["subgraph_tgt_0"][:]
-        subgraph_tgt_1 = file["subgraph_tgt_1"][:]
-        subgraph_bgd_0 = file["subgraph_bgd_0"][:]
-        subgraph_bgd_1 = file["subgraph_bgd_1"][:]
-        walks_src = file["walks_src"][:]
-        walks_tgt = file["walks_tgt"][:]
-        walks_bgd = file["walks_bgd"][:]
-        dst_fake = file["dst_fake"][:]
-        file.close()
-
-        walks_src_new, walks_tgt_new, walks_bgd_new = marginal(walks_src, walks_tgt, walks_bgd)
-        file_new = h5py.File(f"{data}_{MODE}_cat.h5", "w")
-        file_new.create_dataset("subgraph_src_0", data=subgraph_src_0)
-        file_new.create_dataset("subgraph_src_1", data=subgraph_src_1)
-        file_new.create_dataset("subgraph_tgt_0", data=subgraph_tgt_0)
-        file_new.create_dataset("subgraph_tgt_1", data=subgraph_tgt_1)
-        file_new.create_dataset("subgraph_bgd_0", data=subgraph_bgd_0)
-        file_new.create_dataset("subgraph_bgd_1", data=subgraph_bgd_1)
-        file_new.create_dataset("walks_src_new", data=walks_src_new)
-        file_new.create_dataset("walks_tgt_new", data=walks_tgt_new)
-        file_new.create_dataset("walks_bgd_new", data=walks_bgd_new)
-        file_new.create_dataset("dst_fake", data=dst_fake)
-        file_new.close()
-        print(f"Done {data} {MODE}")
-
-
 

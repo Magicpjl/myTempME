@@ -372,6 +372,13 @@ class TempME_TGAT(nn.Module):
         self.time_encoder = TimeEncode(expand_dim=self.time_dim)
         self.null_model = get_null_distribution(data_name=data)
         self.prior = prior
+        self.GRU = torch.nn.GRU(
+            input_size=self.gru_dim,
+            hidden_size=self.out_dim,
+            batch_first=True
+        )
+        self.base_type = "tgat"
+
         
         
 
@@ -397,6 +404,11 @@ class TempME_TGAT(nn.Module):
         src_emb = src_emb.repeat(1, n_walk, 1)
         tgt_emb = tgt_emb.repeat(1, n_walk, 1)
         assert combined_features.size(-1) == self.gru_dim
+        bsz, n_walk, len_walk, _ = combined_features.size()
+        walk_input = combined_features.view(bsz * n_walk, len_walk, self.gru_dim)
+        walk_output, _ = self.GRU(walk_input)
+        graphlet_emb = walk_output[:, -1, :].view(bsz, n_walk, self.out_dim)
+
         if self.if_attn:
             graphlet_emb = self.self_attention(graphlet_emb)  #[bsz, n_walk, out_dim]
         graphlet_features = torch.cat((graphlet_emb, src_emb, tgt_emb), dim=-1)
@@ -470,7 +482,51 @@ class TempME_TGAT(nn.Module):
         tgt_features = self.node_raw_embed(tgt_node)
         node_features = torch.cat([src_features, tgt_features], dim=-1)
         return node_features
+    def retrieve_edge_imp_node(self, subgraph, graphlet_imp, walks, training=True):
+        '''
+        :param subgraph:
+        :param graphlet_imp: #[bsz, n_walk, 1]
+        :param walks: (n_id: [batch, n_walk, 6]
+                  e_id: [batch, n_walk, 3]
+                  t_id: [batch, n_walk, 3]
+                  anony_id: [batch, n_walk, 3)
+        :return: edge_imp_0: [batch, 20]
+                 edge_imp_1: [batch, 20 * 20]
+        '''
+        node_record, eidx_record, t_record = subgraph
+        # each of them is a list of k numpy arrays,  first: (batch, n_degree), second: [batch, n_degree*n_degree]
+        edge_idx_0, edge_idx_1 = eidx_record[0], eidx_record[1]
+        index_tensor_0 = torch.from_numpy(edge_idx_0).long().to(self.device)
+        index_tensor_1 = torch.from_numpy(edge_idx_1).long().to(self.device)
+        edge_walk = walks[1]
+        num_edges = int(max(np.max(edge_idx_0), np.max(edge_idx_1), np.max(edge_walk)) + 1)
+        edge_walk = edge_walk.reshape(edge_walk.shape[0], -1)   #[bsz, n_walk * 3]
+        edge_walk = torch.from_numpy(edge_walk).long().to(self.device)
+        walk_imp = graphlet_imp.repeat(1,1,3).view(edge_walk.shape[0], -1)  #[bsz, n_walk * 3]
+        edge_imp = scatter(walk_imp, edge_walk, dim=-1, dim_size=num_edges, reduce="max")  #[bsz, num_edges]
+        edge_imp_0 = torch.gather(edge_imp, dim=-1, index=index_tensor_0)
+        edge_imp_1 = torch.gather(edge_imp, dim=-1, index=index_tensor_1)
+        edge_imp_0 = self.concrete_bern(edge_imp_0, training)
+        edge_imp_1 = self.concrete_bern(edge_imp_1, training)
+        batch_node_idx0 = torch.from_numpy(node_record[0]).long().to(self.device)
+        mask0 = batch_node_idx0 == 0
+        edge_imp_0 = edge_imp_0.masked_fill(mask0, 0)
+        batch_node_idx1 = torch.from_numpy(node_record[1]).long().to(self.device)
+        mask1 = batch_node_idx1 == 0
+        edge_imp_1 = edge_imp_1.masked_fill(mask1, 0)
+        return edge_imp_0, edge_imp_1
 
+    def retrieve_explanation(self, subgraph_src, graphlet_imp_src, walks_src,
+                             subgraph_tgt, graphlet_imp_tgt, walks_tgt,
+                             subgraph_bgd, graphlet_imp_bgd, walks_bgd, training=True):
+        src_0, src_1 = self.retrieve_edge_imp_node(subgraph_src, graphlet_imp_src, walks_src, training=training)
+        tgt_0, tgt_1 = self.retrieve_edge_imp_node(subgraph_tgt, graphlet_imp_tgt, walks_tgt, training=training)
+        bgd_0, bgd_1 = self.retrieve_edge_imp_node(subgraph_bgd, graphlet_imp_bgd, walks_bgd, training=training)
+        if self.base_type == "tgn":
+            edge_imp = [torch.cat([src_0, tgt_0, bgd_0], dim=0), torch.cat([src_1, tgt_1, bgd_1], dim=0)]
+        else:
+            edge_imp = [torch.cat([src_0, tgt_0, bgd_0], dim=0)]
+        return edge_imp
     def attention_encode(self, X, mask=None):
         '''
         :param X: [bsz, n_walk, len_walk, gru_dim]
